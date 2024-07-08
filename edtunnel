@@ -1,0 +1,258 @@
+为了实现一个完整的流量销售和管理系统，并支持BTC、ETH、USDT、USDC支付，我们需要整合后端和前端的代码，并使用一个支付处理器（如Coinbase Commerce）来处理支付。以下是一个完整的示例，其中包含后端代码（Node.js + Express + MongoDB）、前端代码（HTML + JavaScript），以及如何检测支付并更新用户流量。
+
+### 整体结构
+
+#### 1. 后端代码（Node.js + Express + MongoDB）
+
+```javascript
+const express = require('express');
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const CoinbaseCommerce = require('@coinbase/commerce-node');
+const Client = CoinbaseCommerce.Client;
+const Charge = CoinbaseCommerce.resources.Charge;
+
+const app = express();
+app.use(express.json());
+app.use(express.static('public')); // Serve static files (HTML, CSS, JS)
+
+Client.init('YOUR_API_KEY');
+
+mongoose.connect('mongodb://localhost:27017/edtunnel', { useNewUrlParser: true, useUnifiedTopology: true });
+
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    trafficLimit: { type: Number, default: 0 },
+    trafficUsed: { type: Number, default: 0 },
+    paymentAddresses: {
+        btc: String,
+        eth: String,
+        usdt: String,
+        usdc: String
+    }
+});
+
+const User = mongoose.model('User', userSchema);
+
+app.post('/register', async (req, res) => {
+    const { username, password, btc, eth, usdt, usdc } = req.body;
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({
+        username,
+        password: hashedPassword,
+        paymentAddresses: { btc, eth, usdt, usdc }
+    });
+    await user.save();
+    res.status(201).send('User registered');
+});
+
+app.post('/login', async (req, res) => {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (user && await bcrypt.compare(password, user.password)) {
+        const token = jwt.sign({ userId: user._id }, 'secret');
+        res.json({ token });
+    } else {
+        res.status(401).send('Invalid credentials');
+    }
+});
+
+const trafficMiddleware = async (req, res, next) => {
+    const token = req.headers['authorization'];
+    if (!token) return res.status(401).send('Access denied');
+    
+    try {
+        const { userId } = jwt.verify(token, 'secret');
+        const user = await User.findById(userId);
+        if (user.trafficUsed >= user.trafficLimit) {
+            return res.status(403).send('Traffic limit reached');
+        }
+
+        // Here, you should properly calculate the actual data usage
+        user.trafficUsed += 1;
+        await user.save();
+        next();
+    } catch (err) {
+        res.status(400).send('Invalid token');
+    }
+};
+
+app.use('/protected', trafficMiddleware);
+
+app.post('/create-charge', async (req, res) => {
+    const { userId, amount } = req.body;
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).send('User not found');
+
+    const chargeData = {
+        name: 'Traffic Package',
+        description: 'Purchase traffic package',
+        local_price: {
+            amount: amount,
+            currency: 'USD'
+        },
+        pricing_type: 'fixed_price',
+        metadata: { userId: user._id.toString() }
+    };
+
+    const charge = await Charge.create(chargeData);
+    res.json(charge);
+});
+
+app.post('/webhook', async (req, res) => {
+    const event = req.body.event;
+
+    if (event.type === 'charge:confirmed') {
+        const charge = event.data;
+        const userId = charge.metadata.userId;
+        const user = await User.findById(userId);
+        user.trafficLimit += charge.pricing.local.amount;  // Assuming 1 USD = 1 GB
+        await user.save();
+    }
+
+    res.status(200).send('Event received');
+});
+
+app.listen(3000, () => console.log('Server running on port 3000'));
+```
+
+#### 2. 前端代码（HTML + JavaScript）
+
+创建一个`public`文件夹，并在其中添加`index.html`和`main.js`文件。
+
+**index.html**：
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Purchase Traffic</title>
+</head>
+<body>
+    <h1>Purchase Traffic Package</h1>
+    <form id="register-form">
+        <h2>Register</h2>
+        <input type="text" id="username" placeholder="Username" required>
+        <input type="password" id="password" placeholder="Password" required>
+        <input type="text" id="btc" placeholder="BTC Address">
+        <input type="text" id="eth" placeholder="ETH Address">
+        <input type="text" id="usdt" placeholder="USDT Address">
+        <input type="text" id="usdc" placeholder="USDC Address">
+        <button type="submit">Register</button>
+    </form>
+
+    <form id="login-form">
+        <h2>Login</h2>
+        <input type="text" id="login-username" placeholder="Username" required>
+        <input type="password" id="login-password" placeholder="Password" required>
+        <button type="submit">Login</button>
+    </form>
+
+    <form id="purchase-form" style="display:none;">
+        <h2>Purchase Traffic</h2>
+        <input type="number" id="amount" placeholder="Amount (USD)" required>
+        <button type="submit">Purchase</button>
+    </form>
+
+    <script src="main.js"></script>
+</body>
+</html>
+```
+
+**main.js**：
+
+```javascript
+document.getElementById('register-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = document.getElementById('username').value;
+    const password = document.getElementById('password').value;
+    const btc = document.getElementById('btc').value;
+    const eth = document.getElementById('eth').value;
+    const usdt = document.getElementById('usdt').value;
+    const usdc = document.getElementById('usdc').value;
+
+    const response = await fetch('/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, btc, eth, usdt, usdc })
+    });
+
+    if (response.ok) {
+        alert('User registered successfully');
+    } else {
+        alert('Error registering user');
+    }
+});
+
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = document.getElementById('login-username').value;
+    const password = document.getElementById('login-password').value;
+
+    const response = await fetch('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+    });
+
+    const data = await response.json();
+
+    if (response.ok) {
+        localStorage.setItem('token', data.token);
+        document.getElementById('purchase-form').style.display = 'block';
+        document.getElementById('login-form').style.display = 'none';
+    } else {
+        alert('Invalid credentials');
+    }
+});
+
+document.getElementById('purchase-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const amount = document.getElementById('amount').value;
+    const token = localStorage.getItem('token');
+    const response = await fetch('/create-charge', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ amount })
+    });
+
+    const data = await response.json();
+    window.location.href = data.hosted_url;
+});
+```
+
+### 3. 配置和运行
+
+1. 安装必要的Node.js依赖：
+    ```bash
+    npm install express mongoose bcrypt jsonwebtoken @coinbase/commerce-node
+    ```
+
+2. 启动MongoDB服务：
+    ```bash
+    mongod
+    ```
+
+3. 启动Node.js服务器：
+    ```bash
+    node app.js
+    ```
+
+4. 打开浏览器并访问`http://localhost:3000`，你将看到购买流量的界面。
+
+### 4. 检测支付
+
+使用Coinbase Commerce的webhook来检测支付状态并更新用户流量。确保你的服务器可以接收来自Coinbase Commerce的webhook请求。
+
+在本示例中，`/webhook`端点将处理支付确认并更新用户的流量配额。你需要将此端点URL配置在Coinbase Commerce的webhook设置中。
+
+通过以上步骤，你将创建一个完整的流量销售和管理系统，支持BTC、ETH、USDT、US
+
+DC支付，并提供一个简单的购买界面。实际应用中，你需要处理更多细节，如错误处理、安全措施等。
